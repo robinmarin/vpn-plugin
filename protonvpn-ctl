@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Proton VPN backend for the Omarchy bar widget.
+
+Wraps the `protonvpn` CLI (which only prints human-readable tables) and
+turns its output into JSON for the panel.
+
+Usage:
+  protonvpn-ctl state                 status + settings + recent countries
+  protonvpn-ctl countries             country list (cached for a week)
+  protonvpn-ctl connect [ARGS...]     `protonvpn connect ARGS`, recording the country
+  protonvpn-ctl disconnect
+  protonvpn-ctl set SETTING VALUE     `protonvpn config set SETTING VALUE`
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+CLI = "protonvpn"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "omarchy-protonvpn"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy-protonvpn"
+RECENT_FILE = STATE_DIR / "recent.json"
+COUNTRIES_FILE = CACHE_DIR / "countries.json"
+COUNTRIES_TTL = 7 * 24 * 3600
+MAX_RECENT = 5
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+SERVER_RE = re.compile(r"^(\S+)\s+in\s+(.+)$")
+SIGNED_OUT_RE = re.compile(r"sign\s*in|not\s+(signed|logged)\s+in|login", re.I)
+# Progress chatter the CLI prints before the real output.
+NOISE_RE = re.compile(r"server list is outdated|updating|this may take a moment", re.I)
+
+
+def run(args, timeout=60):
+    try:
+        r = subprocess.run([CLI] + args, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 124, "", "Timed out waiting for protonvpn"
+    return r.returncode, ANSI_RE.sub("", r.stdout), ANSI_RE.sub("", r.stderr)
+
+
+def lines(text):
+    return [l.rstrip() for l in text.splitlines() if l.strip() and not NOISE_RE.search(l)]
+
+
+def last_message(out, err):
+    msgs = lines(err) or lines(out)
+    if not msgs:
+        return ""
+    msg = msgs[-1].strip()
+    # Prefer an explicit "Error: ..." line when click printed usage after it.
+    for l in msgs:
+        if l.strip().lower().startswith("error"):
+            msg = l.strip()
+            break
+    return re.sub(r"^error:\s*", "", msg, flags=re.I)
+
+
+def table_rows(text):
+    """Rows of a `tabulate`-style table: everything after the dashed rule."""
+    rows, body = [], False
+    for l in text.splitlines():
+        if re.match(r"^\s*-{3,}(\s+-{3,})*\s*$", l):
+            body = True
+            continue
+        if body:
+            if not l.strip():
+                break
+            rows.append(re.split(r"\s{2,}", l.strip()))
+    return rows
+
+
+def country_code_from_server(server):
+    # "SE#183" -> SE, Secure Core "CH-SE#1" -> SE (the exit country).
+    head = server.split("#", 1)[0]
+    return head.split("-")[-1].upper() if head else ""
+
+
+def parse_status(code, out, err):
+    fields = {}
+    for l in lines(out):
+        if ":" in l:
+            k, v = l.split(":", 1)
+            fields[k.strip().lower()] = v.strip()
+    status = {
+        "connected": fields.get("status", "").lower() == "connected",
+        "signedIn": True,
+        "server": "", "city": "", "country": "", "countryCode": "",
+        "load": -1, "protocol": fields.get("protocol", ""),
+    }
+    if "status" not in fields and SIGNED_OUT_RE.search(out + err):
+        status["signedIn"] = False
+    m = SERVER_RE.match(fields.get("server", ""))
+    if m:
+        status["server"] = m.group(1)
+        place = [p.strip() for p in m.group(2).split(",", 1)]
+        status["city"] = place[0]
+        status["country"] = place[1] if len(place) > 1 else ""
+        status["countryCode"] = country_code_from_server(m.group(1))
+    load = re.match(r"(\d+)", fields.get("load", ""))
+    if load:
+        status["load"] = int(load.group(1))
+    if code != 0 and "status" not in fields:
+        status["error"] = last_message(out, err)
+    return status
+
+
+def parse_config(out):
+    config = {}
+    for row in table_rows(out):
+        if len(row) >= 2:
+            config[row[0]] = row[1]
+    return config
+
+
+def read_json(path, fallback):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return fallback
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def load_countries(force=False):
+    cached = read_json(COUNTRIES_FILE, None)
+    fresh = COUNTRIES_FILE.exists() and time.time() - COUNTRIES_FILE.stat().st_mtime < COUNTRIES_TTL
+    if cached and fresh and not force:
+        return cached
+    code, out, err = run(["countries", "list"])
+    countries = [{"name": r[0], "code": r[1].upper()}
+                 for r in table_rows(out) if len(r) >= 2 and re.fullmatch(r"[A-Za-z]{2}", r[1])]
+    if countries:
+        write_json(COUNTRIES_FILE, countries)
+        return countries
+    return cached or []
+
+
+def country_name(code):
+    for c in load_countries():
+        if c["code"] == code:
+            return c["name"]
+    return code
+
+
+def record_recent(code):
+    recent = [r for r in read_json(RECENT_FILE, []) if r.get("code") != code]
+    recent.insert(0, {"code": code, "name": country_name(code)})
+    write_json(RECENT_FILE, recent[:MAX_RECENT])
+
+
+def cmd_state():
+    if not shutil.which(CLI):
+        print(json.dumps({"installed": False}))
+        return 0
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        status_f = pool.submit(run, ["status"])
+        config_f = pool.submit(run, ["config", "list"])
+        status = parse_status(*status_f.result())
+        config = parse_config(config_f.result()[1])
+    status.update({"installed": True, "config": config, "recent": read_json(RECENT_FILE, [])})
+    print(json.dumps(status))
+    return 0
+
+
+def cmd_countries():
+    print(json.dumps(load_countries(force="--refresh" in sys.argv)))
+    return 0
+
+
+def report(code, out, err, ok_message):
+    if code == 0:
+        print(ok_message)
+        return 0
+    print(last_message(out, err) or f"protonvpn exited with status {code}", file=sys.stderr)
+    return code or 1
+
+
+def cmd_connect(args):
+    code, out, err = run(["connect"] + args, timeout=120)
+    # Switching servers: drop the current tunnel first if the CLI refuses.
+    if code != 0 and re.search(r"already connected", out + err, re.I):
+        run(["disconnect"])
+        code, out, err = run(["connect"] + args, timeout=120)
+    if code == 0 and "--country" in args:
+        i = args.index("--country")
+        if i + 1 < len(args):
+            record_recent(args[i + 1].upper())
+    return report(code, out, err, "Connected")
+
+
+def cmd_disconnect():
+    return report(*run(["disconnect"]), "Disconnected")
+
+
+def cmd_set(args):
+    if len(args) != 2:
+        print("usage: protonvpn-ctl set SETTING VALUE", file=sys.stderr)
+        return 2
+    return report(*run(["config", "set"] + args), f"{args[0]} set to {args[1]}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "state":
+        return cmd_state()
+    if cmd == "countries":
+        return cmd_countries()
+    if cmd == "connect":
+        return cmd_connect(args)
+    if cmd == "disconnect":
+        return cmd_disconnect()
+    if cmd == "set":
+        return cmd_set(args)
+    print(f"unknown command: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
